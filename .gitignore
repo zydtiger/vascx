@@ -1,0 +1,8 @@
+*.pyc
+__pycache__
+*.egg-info
+*.zip
+/data/LES-AV/*
+!/data/LES-AV/original
+/data/samples/*
+!/data/samples/original
