@@ -6,4 +6,5 @@ __pycache__
 !/data/LES-AV/original
 /data/samples/*
 !/data/samples/original
+/data/ODIR
 .claude
