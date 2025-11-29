@@ -80,9 +80,9 @@ def create_zone_mask(
     # Calculate distance from center for each pixel
     distances = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
 
-    inner_radius = inner_diameter_factor * disc_diameter
-    outer_radius = outer_diameter_factor * disc_diameter
-    zone_mask = (distances >= inner_radius) & (distances <= outer_radius)
+    zone_inner_radius = inner_diameter_factor * disc_diameter
+    zone_outer_radius = outer_diameter_factor * disc_diameter
+    zone_mask = (distances >= zone_inner_radius) & (distances <= zone_outer_radius)
 
     return zone_mask
 
