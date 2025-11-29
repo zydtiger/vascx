@@ -37,10 +37,10 @@ def load_disc_mask(mask_name: str, discs_dir: Path) -> np.ndarray:
     return load_mask_image(disc_path)
 
 
-def create_zone_a_mask(
+def create_zone_mask(
     disc_mask: np.ndarray,
     inner_radius_factor: float = 1.0,
-    outer_radius_factor: float = 1.5,
+    outer_radius_factor: float = 2.0,
 ) -> np.ndarray:
     """Create a binary mask for Zone A (annular region between 1.0-1.5 disc diameters)."""
     # Find disc center and radius
@@ -86,7 +86,7 @@ def calculate_mean_diameter(
     """
     # Create Zone A mask if restriction is enabled
     if restrict_to_zone_a and disc_mask is not None:
-        zone_a_mask = create_zone_a_mask(disc_mask)
+        zone_a_mask = create_zone_mask(disc_mask)
         # Apply Zone A restriction to vessel mask
         restricted_mask = mask & zone_a_mask
     else:
@@ -99,7 +99,9 @@ def calculate_mean_diameter(
     skeleton = skeletonize(restricted_mask > 0)
     # Get distances only from centerline pixels
     vessel_distances = distance[skeleton]
-
+    # If empty (no skeletonized pixels), return 0.0
+    if vessel_distances.size == 0:
+        return 0.0
     # Diameter is 2 * radius (distance transform gives radius)
     diameters = vessel_distances * 2
 
@@ -121,7 +123,7 @@ def calculate_largest_diameter(
     """
     # Create Zone A mask if restriction is enabled
     if restrict_to_zone_a and disc_mask is not None:
-        zone_a_mask = create_zone_a_mask(disc_mask)
+        zone_a_mask = create_zone_mask(disc_mask)
         # Apply Zone A restriction to vessel mask
         restricted_mask = mask & zone_a_mask
     else:
@@ -134,7 +136,9 @@ def calculate_largest_diameter(
     skeleton = skeletonize(restricted_mask > 0)
     # Get distances only from centerline pixels
     vessel_distances = distance[skeleton]
-
+    # If empty (no skeletonized pixels), return 0.0
+    if vessel_distances.size == 0:
+        return 0.0
     # Diameter is 2 * radius (distance transform gives radius)
     diameters = vessel_distances * 2
 
@@ -142,38 +146,21 @@ def calculate_largest_diameter(
     return np.max(diameters)
 
 
-def find_matching_files(arteries_dir: Path, veins_dir: Path) -> list:
-    """Find matching mask files in arteries and veins directories."""
-    artery_files = [
-        f
-        for f in os.listdir(arteries_dir)
-        if f.endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp"))
-    ]
-    vein_files = [
-        f
-        for f in os.listdir(veins_dir)
-        if f.endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp"))
-    ]
-
-    # Find common files
-    common_files = list(set(artery_files) & set(vein_files))
-
-    return sorted(common_files)
-
-
-def get_diagnosis(
-    mask_name: str, diagnosis_data: Optional[pd.DataFrame]
-) -> Optional[str]:
+def get_diagnosis(mask_name: str, diagnosis_data: pd.DataFrame) -> str:
     """Get diagnosis for a given mask name from the diagnosis dataframe."""
-    if diagnosis_data is None:
-        return None
-
-    # Remove file extension from mask_name
     mask_base_name = os.path.splitext(mask_name)[0]
-    matching_row = diagnosis_data[
-        diagnosis_data["Identifier"].astype(str) == mask_base_name
-    ]
-    return matching_row["Diagnosis5"].iloc[0]
+
+    id = mask_base_name.split("_")[0]
+    location = mask_base_name.split("_")[1]
+
+    matching_row = diagnosis_data[diagnosis_data["ID"] == id]
+    diagnosis_col = (
+        "Left-Diagnostic Keywords"
+        if location == "left"
+        else "Right-Diagnostic Keywords"
+    )
+
+    return matching_row[diagnosis_col].iloc[0]
 
 
 def process_mask_pair(
@@ -181,7 +168,7 @@ def process_mask_pair(
     arteries_dir: Path,
     veins_dir: Path,
     discs_dir: Path,
-    diagnosis_data: Optional[pd.DataFrame],
+    diagnosis_data: pd.DataFrame,
     restrict_to_zone_a: bool = True,
 ) -> tuple:
     """Process a pair of masks and return MAD, MVD, AVR, LAD, LVD, LAVR, and diagnosis."""
@@ -195,14 +182,14 @@ def process_mask_pair(
     MVD = calculate_mean_diameter(vein_mask, disc_mask, restrict_to_zone_a)
 
     # Calculate AVR (Arteriole-Venular Ratio)
-    AVR = MAD / MVD
+    AVR = MAD / MVD if MVD != 0 else 0
 
     # Calculate largest diameters using skeleton and Zone A restriction
     LAD = calculate_largest_diameter(artery_mask, disc_mask, restrict_to_zone_a)
     LVD = calculate_largest_diameter(vein_mask, disc_mask, restrict_to_zone_a)
 
     # Calculate LAVR (Largest Arteriole-Venular Ratio)
-    LAVR = LAD / LVD
+    LAVR = LAD / LVD if LVD != 0 else 0
 
     # Get diagnosis
     diagnosis = get_diagnosis(mask_name, diagnosis_data)
@@ -213,15 +200,25 @@ def process_mask_pair(
 @app.command()
 def main(
     arteries_dir: Path = typer.Option(
-        Path("./arteries"),
+        ...,
         "--arteries",
         help="Directory containing arteriole mask images",
     ),
     veins_dir: Path = typer.Option(
-        Path("./veins"), "--veins", help="Directory containing venular mask images"
+        ...,
+        "--veins",
+        help="Directory containing venular mask images",
     ),
     discs_dir: Path = typer.Option(
-        Path("./discs"), "--discs", help="Directory containing optic disc mask images"
+        ...,
+        "--discs",
+        help="Directory containing optic disc mask images",
+    ),
+    diagnosis_path: Path = typer.Option(
+        ..., "--diagnosis", help="Diagnostic data table file."
+    ),
+    ref_dir: Path = typer.Option(
+        None, "--ref", help="Directory containing image names to be processed"
     ),
     output_csv: Path = typer.Option(
         Path("avr_lavr_results.csv"),
@@ -244,37 +241,32 @@ def main(
             )
             raise typer.Exit(1)
 
+    # Check data completeness
+    if ref_dir is None:
+        ref_dir = arteries_dir
+    queued_imgs = [img.name for img in ref_dir.glob("*.png")]
+    for img_name in queued_imgs:
+        for dir_path in [arteries_dir, veins_dir, discs_dir]:
+            target_img = dir_path / img_name
+            if not target_img.exists():
+                typer.echo(f"Error: {target_img} not found.", err=True)
+                raise typer.Exit(1)
+
+    typer.echo(f"Found {len(queued_imgs)} queued image files.")
+
     # Try to load diagnosis data if available
-    diagnosis_data = None
-    data_file = Path("Data.xlsx")
-    if data_file.exists():
-        try:
-            diagnosis_data = pd.read_excel(data_file)
-            typer.echo(f"Loaded diagnosis data from {data_file}")
-        except Exception as e:
-            typer.echo(f"Warning: Could not load {data_file}: {e}")
-
-    # Find matching mask files
-    matching_files = find_matching_files(arteries_dir, veins_dir)
-    typer.echo(f"Found {len(matching_files)} matching mask files")
-
-    if len(matching_files) == 0:
-        typer.echo(
-            "No matching mask files found. Please check the directories.", err=True
-        )
+    try:
+        diagnosis_data = pd.read_csv(diagnosis_path)
+        typer.echo(f"Loaded diagnosis data from {diagnosis_path}")
+    except Exception as e:
+        typer.echo(f"Error: Could not load {diagnosis_path}: {e}", err=True)
         raise typer.Exit(1)
-
-    typer.echo("Matching files:")
-    for file in matching_files[:5]:  # Show first 5 files
-        typer.echo(f"  - {file}")
-    if len(matching_files) > 5:
-        typer.echo(f"  ... and {len(matching_files) - 5} more files")
 
     # Initialize results list
     results_zone_a = []
 
     # Process each matching mask pair using Zone A restriction
-    for mask_name in matching_files:
+    for mask_name in queued_imgs:
         typer.echo(f"Processing {mask_name}...")
 
         # Process with Zone A restriction (skeleton-only method)
@@ -294,7 +286,7 @@ def main(
 
         results_zone_a.append(
             {
-                "mask_name": int(mask_base_name),
+                "mask_name": mask_base_name,
                 "diagnosis": diagnosis,
                 "MAD": MAD_zone,
                 "MVD": MVD_zone,
@@ -315,9 +307,6 @@ def main(
 
     # Create DataFrame and save results
     df_zone_a = pd.DataFrame(results_zone_a)
-
-    # Sort by mask_name
-    df_zone_a = df_zone_a.sort_values("mask_name").reset_index(drop=True)
 
     # Display summary statistics
     typer.echo("\n=== ZONE A RESTRICTED RESULTS ===")
