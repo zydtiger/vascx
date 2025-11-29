@@ -2,10 +2,11 @@
 Calculate Arteriole-Venular Ratios from retinal vessel masks.
 
 This script loads arteriole and venular mask images, calculates both mean and largest diameters
-restricted to Zone A (1.0-1.5 disc diameters from optic disc center), and
+restricted to multiple zones (disc, A, B, C) based on disc diameters from optic disc center, and
 computes both mean and largest arteriole-venular ratios.
 Outputs MAD (Mean Artery Diameter), MVD (Mean Vein Diameter), AVR (Mean Ratio),
-LAD (Largest Artery Diameter), LVD (Largest Vein Diameter), and LAVR (Largest Ratio).
+LAD (Largest Artery Diameter), LVD (Largest Vein Diameter), and LAVR (Largest Ratio)
+for each zone in separate CSV files.
 """
 
 import numpy as np
@@ -15,8 +16,15 @@ from pathlib import Path
 from skimage import io, measure
 from skimage.morphology import skeletonize
 from scipy import ndimage
-import typer
 from typing import Optional
+import typer
+
+ZONE_PARAMS: dict[str, tuple[float, float]] = {
+    "disc": (0.0, 0.5),  # disc diameter
+    "A": (0.5, 1.0),
+    "B": (1.0, 1.5),
+    "C": (1.0, 2.5),
+}
 
 app = typer.Typer(
     help="Calculate Arteriole-Venular Ratios (AVR and LAVR) from retinal vessel masks"
@@ -39,10 +47,19 @@ def load_disc_mask(mask_name: str, discs_dir: Path) -> np.ndarray:
 
 def create_zone_mask(
     disc_mask: np.ndarray,
-    inner_radius_factor: float = 1.0,
-    outer_radius_factor: float = 2.0,
+    inner_diameter_factor: float,
+    outer_diameter_factor: float,
 ) -> np.ndarray:
-    """Create a binary mask for Zone A (annular region between 1.0-1.5 disc diameters)."""
+    """Create a binary mask for a specified zone using disc diameter factors.
+
+    Args:
+        disc_mask: Binary mask of optic disc
+        inner_diameter_factor: Inner boundary as factor of disc diameter (e.g., 0.5 = half disc diameter)
+        outer_diameter_factor: Outer boundary as factor of disc diameter (e.g., 1.0 = one disc diameter)
+
+    Returns:
+        Binary mask for the specified zone
+    """
     # Find disc center and radius
     labeled_disc = measure.label(disc_mask)
     regions = measure.regionprops(labeled_disc)
@@ -52,9 +69,9 @@ def create_zone_mask(
     center_y, center_x = largest_region.centroid
 
     # Calculate disc radius as average of minor and major axes lengths divided by 2
-    disc_radius = (
+    disc_diameter = (
         largest_region.major_axis_length + largest_region.minor_axis_length
-    ) / 4
+    ) / 2
 
     # Create coordinate grids
     height, width = disc_mask.shape
@@ -63,34 +80,26 @@ def create_zone_mask(
     # Calculate distance from center for each pixel
     distances = np.sqrt((x - center_x) ** 2 + (y - center_y) ** 2)
 
-    # Create Zone A mask (annular region between inner_radius_factor and outer_radius_factor * disc_radius)
-    inner_radius = inner_radius_factor * disc_radius
-    outer_radius = outer_radius_factor * disc_radius
+    inner_radius = inner_diameter_factor * disc_diameter
+    outer_radius = outer_diameter_factor * disc_diameter
+    zone_mask = (distances >= inner_radius) & (distances <= outer_radius)
 
-    zone_a_mask = (distances >= inner_radius) & (distances <= outer_radius)
-
-    return zone_a_mask
+    return zone_mask
 
 
 def calculate_mean_diameter(
-    mask: np.ndarray,
-    disc_mask: Optional[np.ndarray] = None,
-    restrict_to_zone_a: bool = True,
+    mask: np.ndarray, disc_mask: np.ndarray, zone: str
 ) -> float:
     """Calculate mean vessel diameter from a binary mask using distance transform and skeleton.
 
     Args:
         mask: Binary mask of vessels
-        disc_mask: Binary mask of optic disc (required if restrict_to_zone_a=True)
-        restrict_to_zone_a: If True, only consider vessels in Zone A (1.0-1.5 disc diameters)
+        disc_mask: Binary mask of optic disc (required for zone restriction)
+        zone: Zone to restrict analysis to (from ZONE_PARAMS)
     """
-    # Create Zone A mask if restriction is enabled
-    if restrict_to_zone_a and disc_mask is not None:
-        zone_a_mask = create_zone_mask(disc_mask)
-        # Apply Zone A restriction to vessel mask
-        restricted_mask = mask & zone_a_mask
-    else:
-        restricted_mask = mask
+    # Create Zone mask if restriction is enabled
+    zone_mask = create_zone_mask(disc_mask, ZONE_PARAMS[zone][0], ZONE_PARAMS[zone][1])
+    restricted_mask = mask & zone_mask
 
     # Calculate distance transform
     distance = ndimage.distance_transform_edt(restricted_mask)
@@ -110,24 +119,18 @@ def calculate_mean_diameter(
 
 
 def calculate_largest_diameter(
-    mask: np.ndarray,
-    disc_mask: Optional[np.ndarray] = None,
-    restrict_to_zone_a: bool = True,
+    mask: np.ndarray, disc_mask: np.ndarray, zone: str
 ) -> float:
     """Calculate largest vessel diameter from a binary mask using distance transform and skeleton.
 
     Args:
         mask: Binary mask of vessels
-        disc_mask: Binary mask of optic disc (required if restrict_to_zone_a=True)
-        restrict_to_zone_a: If True, only consider vessels in Zone A (1.0-1.5 disc diameters)
+        disc_mask: Binary mask of optic disc (required for zone restriction)
+        zone: Zone to restrict analysis to (from ZONE_PARAMS)
     """
-    # Create Zone A mask if restriction is enabled
-    if restrict_to_zone_a and disc_mask is not None:
-        zone_a_mask = create_zone_mask(disc_mask)
-        # Apply Zone A restriction to vessel mask
-        restricted_mask = mask & zone_a_mask
-    else:
-        restricted_mask = mask
+    # Create zone mask
+    zone_mask = create_zone_mask(disc_mask, ZONE_PARAMS[zone][0], ZONE_PARAMS[zone][1])
+    restricted_mask = mask & zone_mask
 
     # Calculate distance transform
     distance = ndimage.distance_transform_edt(restricted_mask)
@@ -146,7 +149,7 @@ def calculate_largest_diameter(
     return np.max(diameters)
 
 
-def get_diagnosis(mask_name: str, diagnosis_data: pd.DataFrame) -> str:
+def get_diagnosis(mask_name: str, diagnosis_data: pd.DataFrame) -> Optional[str]:
     """Get diagnosis for a given mask name from the diagnosis dataframe."""
     mask_base_name = os.path.splitext(mask_name)[0]
 
@@ -154,6 +157,9 @@ def get_diagnosis(mask_name: str, diagnosis_data: pd.DataFrame) -> str:
     location = mask_base_name.split("_")[1]
 
     matching_row = diagnosis_data[diagnosis_data["ID"] == id]
+    if len(matching_row) == 0:
+        return None
+
     diagnosis_col = (
         "Left-Diagnostic Keywords"
         if location == "left"
@@ -169,32 +175,51 @@ def process_mask_pair(
     veins_dir: Path,
     discs_dir: Path,
     diagnosis_data: pd.DataFrame,
-    restrict_to_zone_a: bool = True,
-) -> tuple:
-    """Process a pair of masks and return MAD, MVD, AVR, LAD, LVD, LAVR, and diagnosis."""
+    zones: list[str],
+) -> dict[str, dict]:
+    """Process a pair of masks for multiple zones and return results for each zone.
+
+    Returns:
+        Dictionary with zone names as keys and result dictionaries as values.
+        Each result dictionary contains MAD, MVD, AVR, LAD, LVD, LAVR.
+    """
     # Load masks
     artery_mask = load_mask_image(arteries_dir / mask_name)
     vein_mask = load_mask_image(veins_dir / mask_name)
-    disc_mask = load_disc_mask(mask_name, discs_dir) if restrict_to_zone_a else None
+    disc_mask = load_disc_mask(mask_name, discs_dir)
 
-    # Calculate mean diameters using skeleton and Zone A restriction
-    MAD = calculate_mean_diameter(artery_mask, disc_mask, restrict_to_zone_a)
-    MVD = calculate_mean_diameter(vein_mask, disc_mask, restrict_to_zone_a)
-
-    # Calculate AVR (Arteriole-Venular Ratio)
-    AVR = MAD / MVD if MVD != 0 else 0
-
-    # Calculate largest diameters using skeleton and Zone A restriction
-    LAD = calculate_largest_diameter(artery_mask, disc_mask, restrict_to_zone_a)
-    LVD = calculate_largest_diameter(vein_mask, disc_mask, restrict_to_zone_a)
-
-    # Calculate LAVR (Largest Arteriole-Venular Ratio)
-    LAVR = LAD / LVD if LVD != 0 else 0
-
-    # Get diagnosis
+    # Get diagnosis (same for all zones)
     diagnosis = get_diagnosis(mask_name, diagnosis_data)
 
-    return MAD, MVD, AVR, LAD, LVD, LAVR, diagnosis
+    results = {}
+
+    # Process each zone
+    for zone in zones:
+        # Calculate mean diameters for this zone
+        MAD = calculate_mean_diameter(artery_mask, disc_mask, zone)
+        MVD = calculate_mean_diameter(vein_mask, disc_mask, zone)
+
+        # Calculate AVR (Arteriole-Venular Ratio)
+        AVR = MAD / MVD if MVD != 0 else 0
+
+        # Calculate largest diameters for this zone
+        LAD = calculate_largest_diameter(artery_mask, disc_mask, zone)
+        LVD = calculate_largest_diameter(vein_mask, disc_mask, zone)
+
+        # Calculate LAVR (Largest Arteriole-Venular Ratio)
+        LAVR = LAD / LVD if LVD != 0 else 0
+
+        results[zone] = {
+            "MAD": MAD,
+            "MVD": MVD,
+            "AVR": AVR,
+            "LAD": LAD,
+            "LVD": LVD,
+            "LAVR": LAVR,
+            "diagnosis": diagnosis,
+        }
+
+    return results
 
 
 @app.command()
@@ -220,13 +245,13 @@ def main(
     ref_dir: Path = typer.Option(
         None, "--ref", help="Directory containing image names to be processed"
     ),
-    output_csv: Path = typer.Option(
-        Path("avr_lavr_results.csv"),
+    output_dir: Path = typer.Option(
+        Path(__file__).parent,
         "--output",
-        help="Output CSV file for AVR and LAVR results",
+        help="Output directory for AVR and LAVR results CSV files",
     ),
 ):
-    """Calculate AVR and LAVR from retinal vessel masks restricted to Zone A."""
+    """Calculate AVR and LAVR from retinal vessel masks for multiple zones."""
 
     # Validate input directories
     for dir_path, dir_name in [
@@ -262,67 +287,88 @@ def main(
         typer.echo(f"Error: Could not load {diagnosis_path}: {e}", err=True)
         raise typer.Exit(1)
 
-    # Initialize results list
-    results_zone_a = []
+    # Define zones to process
+    zones_to_process = list(ZONE_PARAMS.keys())
+    typer.echo(f"Processing zones: {', '.join(zones_to_process)}")
 
-    # Process each matching mask pair using Zone A restriction
+    # Initialize results dictionary for each zone
+    results_by_zone = {zone: [] for zone in zones_to_process}
+
+    # Process each matching mask pair for all zones
     for mask_name in queued_imgs:
         typer.echo(f"Processing {mask_name}...")
 
-        # Process with Zone A restriction (skeleton-only method)
-        MAD_zone, MVD_zone, AVR_zone, LAD_zone, LVD_zone, LAVR_zone, diagnosis = (
-            process_mask_pair(
-                mask_name,
-                arteries_dir,
-                veins_dir,
-                discs_dir,
-                diagnosis_data,
-                restrict_to_zone_a=True,
-            )
+        # Process for all zones
+        zone_results = process_mask_pair(
+            mask_name,
+            arteries_dir,
+            veins_dir,
+            discs_dir,
+            diagnosis_data,
+            zones_to_process,
         )
 
         # Remove file extension from mask_name
         mask_base_name = os.path.splitext(mask_name)[0]
 
-        results_zone_a.append(
-            {
-                "mask_name": mask_base_name,
-                "diagnosis": diagnosis,
-                "MAD": MAD_zone,
-                "MVD": MVD_zone,
-                "AVR": AVR_zone,
-                "LAD": LAD_zone,
-                "LVD": LVD_zone,
-                "LAVR": LAVR_zone,
-            }
-        )
+        # Organize results by zone
+        for zone in zones_to_process:
+            zone_data = zone_results[zone]
+            results_by_zone[zone].append(
+                {
+                    "mask_name": mask_base_name,
+                    "diagnosis": zone_data["diagnosis"],
+                    "MAD": zone_data["MAD"],
+                    "MVD": zone_data["MVD"],
+                    "AVR": zone_data["AVR"],
+                    "LAD": zone_data["LAD"],
+                    "LVD": zone_data["LVD"],
+                    "LAVR": zone_data["LAVR"],
+                }
+            )
 
+            # Print results for this zone
+            zone_display = (
+                "Zone " + zone.upper() if zone != "disc" else zone.capitalize()
+            )
+            typer.echo(
+                f"  {zone_display} - MAD: {zone_data['MAD']:.2f}, MVD: {zone_data['MVD']:.2f}, "
+                f"AVR: {zone_data['AVR']:.3f}, LAD: {zone_data['LAD']:.2f}, "
+                f"LVD: {zone_data['LVD']:.2f}, LAVR: {zone_data['LAVR']:.3f}"
+            )
+
+    typer.echo(f"\nSuccessfully processed {len(queued_imgs)} mask pairs for all zones")
+
+    # Create DataFrames and save results for each zone
+    output_dir.mkdir(exist_ok=True)
+
+    for zone in zones_to_process:
+        df_zone = pd.DataFrame(results_by_zone[zone])
+
+        # Create filename based on zone
+        if zone == "disc":
+            filename = "avr_results_disc.csv"
+        else:
+            filename = f"avr_results_zone_{zone}.csv"
+
+        output_path = output_dir / filename
+        df_zone.to_csv(output_path, index=False)
+
+        # Display summary statistics for this zone
+        zone_display = "Zone " + zone.upper() if zone != "disc" else zone.capitalize()
+        typer.echo(f"\n=== {zone_display.upper()} RESTRICTED RESULTS ===")
         typer.echo(
-            f"  Zone A - MAD: {MAD_zone:.2f}, MVD: {MVD_zone:.2f}, AVR: {AVR_zone:.3f}, LAD: {LAD_zone:.2f}, LVD: {LVD_zone:.2f}, LAVR: {LAVR_zone:.3f}"
+            df_zone[["MAD", "MVD", "AVR", "LAD", "LVD", "LAVR"]].describe().to_string()
         )
 
-    typer.echo(
-        f"\nSuccessfully processed {len(results_zone_a)} mask pairs with Zone A restriction"
-    )
+        # Display first few rows
+        typer.echo(f"\n=== {zone_display.upper()} DETAILED RESULTS (First 10) ===")
+        typer.echo(df_zone.head(10).to_string())
 
-    # Create DataFrame and save results
-    df_zone_a = pd.DataFrame(results_zone_a)
+        typer.echo(f"\n{zone_display} results saved to: {output_path}")
 
-    # Display summary statistics
-    typer.echo("\n=== ZONE A RESTRICTED RESULTS ===")
-    typer.echo(
-        df_zone_a[["MAD", "MVD", "AVR", "LAD", "LVD", "LAVR"]].describe().to_string()
-    )
-
-    # Display first few rows
-    typer.echo("\n=== DETAILED RESULTS (First 10) ===")
-    typer.echo(df_zone_a.head(10).to_string())
-
-    # Save results as CSV
-    df_zone_a.to_csv(output_csv, index=False)
-
-    typer.echo(f"\nResults saved to: {output_csv}")
-    typer.echo(f"Total samples processed: {len(df_zone_a)}")
+    typer.echo(f"\nTotal samples processed: {len(queued_imgs)}")
+    typer.echo(f"CSV files saved in: {output_dir}")
 
 
 if __name__ == "__main__":
